@@ -17,7 +17,7 @@
 #define MAX_NUM_OF_MAPS 130
 #define MAX_NUM_OF_BREAKS 130
 
-#define TRACE_ALL_MMAP 1
+#define TRACE_ALL_MMAP 0
 
 // change to PROT_NONE if you want trace reading operations also.
 #define TRACE_PROT PROT_READ
@@ -26,7 +26,7 @@
 #define ADDR_TYPE uint64_t
 uint8_t BREAKPOINT[1] = {0xcc};
 #define MAX_INST_SIZE 16 /* FIXME: */
-#define INST_PTR(context) (((ucontext_t*)context)->uc_mcontext.gregs[X86_REG_RIP])
+#define INST_PTR(context) ((ucontext_t*)context)->uc_mcontext.gregs[REG_RIP]
 #elif defined(__aarch64__)
 #define ADDR_TYPE uint64_t
 uint8_t BREAKPOINT[4] = {0, 0, 0x20, 0xd4};
@@ -40,7 +40,7 @@ uint8_t BREAKPOINT[4] = {0, 0, 0x20, 0xd4};
 
 int text_copy(void * target, void* source, size_t length);
 static inline void clear_cache_line(void *beg);
-static void dump_stack(void);
+static void dump_stack(int skip);
 
 
 typedef struct {
@@ -97,17 +97,18 @@ static segfault_t context;
  */
 static void thats_all_folks(void)
 {
-  dump_stack();
+  dump_stack(0);
   exit(-1);
 }
 
-static void dump_stack(void)
+static void dump_stack(int skip)
 {
   void *array[10];
   size_t size;
   /* print traceback */
   size = backtrace(array, 10);
-  backtrace_symbols_fd(array, size, 2);
+  if (size > skip)
+    backtrace_symbols_fd(array+skip, size-skip, 2);
 }
 
 
@@ -209,11 +210,12 @@ static void del_map(void* addr)
 }
 
 
+
 /*
  * find if there is a breakpoint with a spsific addr
  */
 static 
-segfault_error_t find_breakpoint(void *addr, breakpoint_t **breakpoint)
+segfault_error_t _find_breakpoint(void *addr, breakpoint_t **breakpoint)
 {
   segfault_error_t status = SEGFAULT_SUCCESS;
 
@@ -232,6 +234,22 @@ segfault_error_t find_breakpoint(void *addr, breakpoint_t **breakpoint)
  l_exit:
   return status;
 }
+
+#if defined(__x86_64)
+static segfault_error_t
+find_breakpoint(void *addr, breakpoint_t **breakpoint)
+{
+  for (int i=0; i<MAX_INST_SIZE; i++) {
+    if (SEGFAULT_SUCCESS == _find_breakpoint(addr -i, breakpoint)) {
+      return SEGFAULT_SUCCESS;
+    }
+  }
+  return SEGFAULT_ADDR_NOT_FOUND;
+}
+#else
+#define find_breakpoint _find_breakpoint
+#endif
+
 
 static void protect(map_t *map)
 {
@@ -280,21 +298,25 @@ void* mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
     thats_all_folks();
   }
 
-
   if (TRACE_ALL_MMAP||fildes != -1 && off > 0) {
-    printf("intercepting mmap(0x%08X, 0x%08X, %d, %d, %d, 0x%08lX) ==\n",
-           (uint64_t)addr, len, prot, flags, fildes, off);
-    dump_stack();
+    printf("intercepting mmap(0x%08X, 0x%08X, %d, %d, %d, 0x%08lX) =>",
+           (uint64_t)addr, len, prot, flags, fildes, off,
+           map->addr
+           );
+    prot = TRACE_PROT;
   }
+
   map->size = len;
-  map->addr = o_mmap(addr, len, TRACE_PROT,
-                     flags, fildes, off);
+  map->addr = o_mmap(addr, len, prot, flags, fildes, off);
   map->saddr = (unsigned long)map->addr;
   map->eaddr = (unsigned long)map->addr + map->size;
 
-  if (fildes != -1 && off > 0) {
-    printf(" ===> %p\n\n\n", map->saddr);
+  if (TRACE_ALL_MMAP||fildes != -1 && off > 0) {
+    printf("%p\n", map->addr);
+    dump_stack(1);
+    puts("\n");
   }
+
   return map->addr;
 }
 
@@ -348,10 +370,7 @@ signal(
  */
 static 
 segfault_error_t 
-set_breakpoint(
-               void *addr,
-               breakpoint_t **breakpoint
-               )
+set_breakpoint(void *addr, breakpoint_t **breakpoint)
 {
   int result = 0;
   breakpoint_t *_breakpoint = NULL;
@@ -369,13 +388,14 @@ set_breakpoint(
     goto l_exit;
   }
 
+
+
   /* save the instraction address and content for later use (when removing the break) */
   _breakpoint->inst_addr = (uint8_t*)addr;
   memcpy(_breakpoint->inst_part, addr, sizeof(BREAKPOINT));
 
   /* FIXME: change the premisstions back to the orginal */
-  result = mprotect(
-                    (void*)(page_align(_breakpoint->inst_addr)),
+  result = mprotect((void*)(page_align(_breakpoint->inst_addr)),
                     getpagesize(),
                     PROT_READ | PROT_WRITE | PROT_EXEC
                     );
@@ -403,18 +423,14 @@ set_breakpoint(
  */
 static 
 segfault_error_t 
-remove_breakpoint(
-                  breakpoint_t *breakpoint
-                  )
+remove_breakpoint(breakpoint_t *breakpoint)
 {
   text_copy(breakpoint->inst_addr, breakpoint->inst_part, sizeof(BREAKPOINT));
   return SEGFAULT_SUCCESS;
 }
 
 
-int text_copy( void * target,
-               void * source,
-               size_t      length)
+int text_copy( void * target, void * source, size_t length)
 {
   const long  page = sysconf(_SC_PAGESIZE);
   void       *start = (char *)target - ((long)target % page);
@@ -451,8 +467,8 @@ static int process_opcode(uint8_t* opcode, int64_t fault_address)
   unsigned int size = 0;
   static cs_insn* insn = 0;
   if (insn != 0) {
-    if (insn->address == (uint64_t)opcode) {
-      return 4;
+    if (insn->address == (ADDR_TYPE)opcode) {
+      return insn->size;
     } else {
       cs_free(insn,  1);
     }
@@ -471,13 +487,13 @@ static int process_opcode(uint8_t* opcode, int64_t fault_address)
   switch (insn->id) {
   case 324: //ARM64_INS_STP
   default:
-    fprintf(context.log,"0x%0lx(%d):\t%s %s #0x%0lx\n",
-            (int64_t)opcode,
+    fprintf(context.log,"CATCH: %p(%d):\t%s %s #0x%0lx\n",
+            opcode,
             insn->id,
             insn->mnemonic, insn->op_str,
             fault_address
             );
-    dump_stack();
+    dump_stack(3);
     fprintf(context.log,"\n");
   }
   return size;
@@ -486,38 +502,35 @@ static int process_opcode(uint8_t* opcode, int64_t fault_address)
 
 /* FIXME: can create starvetion? */
 static 
-void 
-trap_handler(
-             int sig,
-             siginfo_t *info,
-             void *signal_ucontext
-             )
+void trap_handler(int sig, siginfo_t *info, void *uc)
 {
   breakpoint_t *breakpoint;
-  uint8_t *addr = NULL;
+  void *addr = NULL;
   segfault_error_t status = SEGFAULT_SUCCESS;
 
-  ucontext_t* uc = signal_ucontext;
-
-  addr = (uint8_t*)(INST_PTR((ucontext_t*)(signal_ucontext)));
-
+  addr = (void*)(INST_PTR(uc));
   /* find the correct breakpoint struct for the given address */
   status = find_breakpoint(addr, &breakpoint);
   if (SEGFAULT_SUCCESS != status) {
-    printf("HHHH In trap_handler:%p\n", addr);
+    printf("Unknown trap in trap_handler:%p %p\n", addr, info->si_addr);
     exit(-1);
     goto l_exit;
   }
+#if defined(__x86_64)
+  // fixup rip address
+  addr = breakpoint->inst_addr;
+  INST_PTR(uc) = (ADDR_TYPE)addr;
+#endif
 
   /* remove the breakpoint */
   status = remove_breakpoint(breakpoint);
   if (SEGFAULT_SUCCESS != status) {
     thats_all_folks();
   }
-    
+
   /* return the instruction pointer back to execute the instruction */
-  INST_PTR(signal_ucontext) = (uint64_t)addr;
   protect(breakpoint->map);
+
 
   del_breakpoint(breakpoint);
  l_exit:
@@ -529,11 +542,7 @@ trap_handler(
  */
 static 
 void 
-segfault_handler(
-                 int sig,
-                 siginfo_t *info,
-                 void *signal_ucontext
-                 )
+segfault_handler(int sig, siginfo_t *info, void *signal_ucontext)
 {
   int instruction_size = 0;
   uint8_t* opcode = NULL;
@@ -553,16 +562,21 @@ segfault_handler(
   ucontext = (ucontext_t*)(signal_ucontext);
   fault_addr = info->si_addr;
 
+
+  /* opcode which caused the segfault is at eip */
+  opcode = (uint8_t*)(INST_PTR(ucontext));
+
   /* try to find the right map which cause the fault */
   status = find_map(fault_addr, &map);
   if (SEGFAULT_SUCCESS != status) {
     /* this means that the segfault wasn't our fault */
-    printf("The address %p isn't mapped by we.\n", fault_addr);
+    printf("The address %p isn't mapped by we.Caused by:%p\n",
+           fault_addr,
+           opcode
+           );
     thats_all_folks();
   }
 
-  /* opcode which caused the segfault is at eip */
-  opcode = (uint8_t*)((uint64_t)(INST_PTR(ucontext)));
 
   /* process opcode */
   instruction_size = process_opcode(opcode, (int64_t)fault_addr);
@@ -592,12 +606,8 @@ segfault_handler(
   return;
 }
 
-/*
- * Initialize
- */
-static
-void 
-segfault_init(void)
+
+static void segfault_init(void)
 {
 #define REPLACE(a, x, y)                            \
   if ( !(o_##x = dlsym(a , y)) ) {                  \
@@ -666,10 +676,12 @@ static void fini(void)
 
 
 void
-clear_cache_line(void *beg)
+clear_cache_line(void *addr)
 {
 #if defined(__aarch64__)
-  __asm__ __volatile__("dc cvau, %0" : : "r"(beg) : "memory");
-  __asm__ __volatile__("ic ivau, %0" : : "r"(beg) : "memory");
+  __asm__ __volatile__("dc cvau, %0" : : "r"(addr) : "memory");
+  __asm__ __volatile__("ic ivau, %0" : : "r"(addr) : "memory");
+#else
+  __builtin___clear_cache(addr, addr+MAX_INST_SIZE);
 #endif
 }
