@@ -17,8 +17,6 @@
 #define MAX_NUM_OF_MAPS 130
 #define MAX_NUM_OF_BREAKS 130
 
-#define TRACE_ALL_MMAP 0
-
 // change to PROT_NONE if you want trace reading operations also.
 #define TRACE_PROT PROT_READ
 
@@ -298,7 +296,10 @@ void* mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
     thats_all_folks();
   }
 
-  if (TRACE_ALL_MMAP||fildes != -1 && off > 0) {
+#if !defined(TRACE_ALL_MMAP)
+  if (fildes != -1 && off > 0)
+#endif
+  {
     printf("intercepting mmap(0x%08X, 0x%08X, %d, %d, %d, 0x%08lX) =>",
            (uint64_t)addr, len, prot, flags, fildes, off,
            map->addr
@@ -311,7 +312,10 @@ void* mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
   map->saddr = (unsigned long)map->addr;
   map->eaddr = (unsigned long)map->addr + map->size;
 
-  if (TRACE_ALL_MMAP||fildes != -1 && off > 0) {
+#if !defined(TRACE_ALL_MMAP)
+  if (fildes != -1 && off > 0)
+#endif
+    {
     printf("%p\n", map->addr);
     dump_stack(1);
     puts("\n");
